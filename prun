@@ -1,0 +1,271 @@
+#!/bin/env python
+
+from __future__ import print_function
+import os,sys,getopt,time,signal,re
+#######################################
+
+g_thread_number=10
+g_task_list=""
+g_quiet=False
+g_quit = False
+g_dump = False
+g_task_array=[]
+
+
+def SIGUSR1_handler(signum, frame) :
+    log_dbg("dump request")
+    global g_dump
+    g_dump = True
+
+def SIGINT_handler(signum, frame) :
+    log_dbg("Ctrl-C pressed")
+    global g_quit
+    g_quit = True
+
+def SIGTERM_handler(signum, frame) :
+    log_dbg("kill -15")
+    global g_quit
+    g_quit = True
+
+def log_inf(fmt, *argv) :
+    if not g_quiet:
+        print("[INF] "+fmt%argv, end="\n", file=sys.stdout)
+
+def log_err(fmt, *argv) :
+    if not g_quiet:
+        print("[ERR] "+fmt%argv, end="\n", file=sys.stdout)
+
+def log_dbg(fmt, *argv) :
+    if not g_quiet:
+        print("[DBG] "+fmt%argv, end="\n", file=sys.stdout)
+
+def usage() :
+    print("Usage prun [options] list_file", end="\n", file=sys.stdout)
+    print("      Options: -h|--help          show help screen", end="\n", file=sys.stdout)
+    print("               -n|--thread-number set thread number, default 10", end="\n", file=sys.stdout)
+    print("               -q|--quiet         quiet", end="\n", file=sys.stdout)   
+
+class task:
+    def __init__(self, task_cmd) :
+        self.__name = task_cmd
+        self.__pid = -1
+        self.__status = "INIT"
+        self.__exit_code = 0
+    def run(self) :
+        os.close(0)
+        os.close(1)
+        os.close(2)
+        os.setsid()
+        sys.stdin = open('/dev/null', 'rb')
+        sys.stdout = open('/dev/null', 'wb')
+        sys.stderr = open('/dev/null', 'wb')
+        os.execv('/bin/sh', ['/bin/sh', '-c', 'exec '+self.__name])
+        #os.execv('/bin/ls', ['/bin/ls'])
+
+    def get_name(self) :
+        return self.__name
+
+    def get_pid(self) :
+        return self.__pid
+    
+    def get_status(self) :
+        return self.__status
+
+    def get_exit_code(self) :
+        return self.__exit_code
+
+    def set_pid(self, pid) :
+        self.__pid = pid
+
+    def set_status(self, status) :
+        self.__status = status
+
+    def set_exit_code(self, exit_code) :
+        self.__exit_code = exit_code
+    
+
+class proc_pool:
+    def __init__(self, proc_cnt, task_array) :
+        self.__tasks = []
+        self.__procs = []
+        if proc_cnt > len(task_array) :
+            proc_cnt = len(task_array)
+        for task in task_array :
+            self.__tasks.append(task)
+        for i in range(0, proc_cnt) :
+            self.__procs.append(self.__tasks[i])
+        self.__task_ok_cnt = 0
+        self.__task_fail_cnt = 0
+        self.__next_task = proc_cnt
+        self.__status = "stop"
+        log_dbg("procs size is %d targets size is %d",
+                len(self.__procs), len(self.__tasks))
+        
+    def start(self):
+        if self.__status == "stop":
+            self.__status = "running"
+            # initilize proc_array
+            for proc in self.__procs:
+                child_pid = os.fork()
+                if child_pid == 0:
+                    proc.run()
+                else:
+                    proc.set_pid(child_pid)
+                    proc.set_status("RUNNING")
+                    proc.set_exit_code(0)
+
+        return self.__status
+
+    def __wait_proc(self, proc):
+        pid = proc.get_pid()
+        status = 0
+        if proc.get_status() == "EXIT" or  proc.get_status() == "KILLED":
+            return 1
+        try:
+            if pid != -1:
+                pid, status = os.waitpid(proc.get_pid(), os.WNOHANG)
+        except OSError as err:
+            log_err("wait4 error(%s): %s, pid is %d", err.errno, err.strerror, pid)
+        if pid != 0:
+            # proc quit
+            if os.WIFEXITED(status) :
+                proc.set_status("EXIT")
+                proc.set_exit_code(os.WEXITSTATUS(status))
+                log_inf("%s exit, status is %d, pid is %d", proc.get_name(), os.WEXITSTATUS(status), pid)
+                proc.set_pid(-1)
+                if os.WEXITSTATUS(status) == 0 :
+                    self.__task_ok_cnt = self.__task_ok_cnt + 1
+                else:
+                    self.__task_fail_cnt = self.__task_fail_cnt + 1
+            elif os.WIFSIGNALED(status) :
+                proc.set_status("KILLED")
+                proc.set_exit_code(os.WTERMSIG(status))
+                log_inf("%s killed, signal is %d, pid is %d", proc.get_name(), os.WTERMSIG(status), pid)
+                proc.set_pid(-1)
+                self.__task_fail_cnt = self.__task_fail_cnt + 1
+            else:
+                    # proc quit for no reason?
+                pass
+            return 1
+        else:
+            return 0
+
+    def run(self):
+        if self.__status == "running":
+            for i in range(0, len(self.__procs)):
+                proc = self.__procs[i]
+                if proc.get_status() == "RUNNING" :
+                    ret = self.__wait_proc(proc)
+                    if ret == 1:
+                        # pick a new target
+                        if self.__next_task < len(self.__tasks) :
+                            proc = self.__tasks[self.__next_task]
+                            self.__procs[i] = proc
+                            self.__next_task = self.__next_task + 1
+                            child_pid = os.fork()
+                            if child_pid == 0:
+                                proc.run()
+                            else:
+                                proc.set_pid(child_pid)
+                                proc.set_status("RUNNING")
+                                proc.set_exit_code(0)
+                        
+                        if (self.__task_ok_cnt + self.__task_fail_cnt) == len(self.__tasks) :
+                            self.__status = "stop"
+                    else:
+                        # no proc quit
+                        pass
+        return self.__status              
+    
+    def stop(self):
+        if self.__status == "running":
+            self.__status == "stopping"
+            # kill all child proc
+            
+            for proc in self.__procs:
+                log_dbg("clean proc %s pid %d", proc.get_name(), proc.get_pid())
+                while self.__wait_proc(proc) != 1:
+                    log_dbg("kill proc %d with %d", proc.get_pid(), signal.SIGKILL)
+                    os.kill(proc.get_pid(), signal.SIGKILL)
+                    time.sleep(1)
+            
+            for task in self.__tasks:
+                if task.get_status() == "INIT":
+                    task.set_status("ABORT");
+                    task.set_exit_code(0);
+            
+            self.__status == "stop"
+        return self.__status
+    
+    def dump(self, out_file):
+        string = '++++total task %d, ok %d ,fail %d+++++\n' % (len(self.__tasks), self.__task_ok_cnt, self.__task_fail_cnt)
+        sys.stdout.write(string)
+        for task in self.__tasks:
+            string = '[%s][%s][%s]\n' % (task.get_status(), task.get_exit_code(), task.get_name())
+            sys.stdout.write(string)
+#######################################
+
+signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+signal.signal(signal.SIGINT, SIGINT_handler)
+signal.signal(signal.SIGTERM, SIGTERM_handler)
+signal.signal(signal.SIGUSR1, SIGUSR1_handler)
+
+try:
+    opts,args = getopt.getopt(sys.argv[1:], "hn:q", ["help", "thread-number=", "quiet="])
+    for opt,arg in opts:
+        if opt in ('-h', "--help"):
+            usage()
+            sys.exit(0)
+        elif opt in ("-n", "--thread-number"):
+            g_thread_number = int(arg)
+        elif opt in ("-q", "--quiet"):
+            g_quiet = True
+        else:
+            usage()
+            sys.exit(1)
+    if len(args) != 1 :
+        usage()
+        sys.exit(1)
+    else:
+        g_task_list = args[0]
+except getopt.GetoptError:
+    sys.exit(1)
+    
+log_inf("task list is %s, thread number is %d", g_task_list, g_thread_number)
+
+# read list file into task array
+try :
+    f = open(g_task_list, 'r')
+    while True:
+        line = f.readline()
+        line = line.strip('\n')
+        if line :
+            g_task_array.append(task(line))
+        else:
+            break
+    f.close()
+except IOError as e:
+    log_err("I/O error(%s): %s", e.errno, e.strerror)
+    
+log_inf("task list %s carry %d items", g_task_list, len(g_task_array))
+    
+# initilize proc pool
+
+procs = proc_pool(g_thread_number, g_task_array)
+
+procs.start()
+
+while procs.run() != "stop" :
+    time.sleep(1)
+    if g_dump :
+        g_dump = False
+        procs.dump(sys.stdout)
+    if g_quit :
+        log_dbg("will quit")
+        procs.stop()
+        break
+
+procs.dump(sys.stdout)
+
+    
+    
