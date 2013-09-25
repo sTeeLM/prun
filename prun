@@ -43,7 +43,7 @@ def usage() :
     print("Usage prun [options] list_file", end="\n", file=sys.stdout)
     print("      Options: -h|--help          show help screen", end="\n", file=sys.stdout)
     print("               -n|--thread-number set thread number, default 10", end="\n", file=sys.stdout)
-    print("               -q|--quiet         quiet", end="\n", file=sys.stdout)   
+    print("               -q|--quiet         quiet", end="\n", file=sys.stdout) 
 
 class task:
     def __init__(self, task_cmd) :
@@ -52,13 +52,8 @@ class task:
         self.__status = "INIT"
         self.__exit_code = 0
     def run(self) :
-        os.close(0)
-        os.close(1)
-        os.close(2)
+        os.closerange(0,65536)
         os.setsid()
-        sys.stdin = open('/dev/null', 'rb')
-        sys.stdout = open('/dev/null', 'wb')
-        sys.stderr = open('/dev/null', 'wb')
         os.execv('/bin/sh', ['/bin/sh', '-c', 'exec '+self.__name])
         #os.execv('/bin/ls', ['/bin/ls'])
 
@@ -211,7 +206,7 @@ signal.signal(signal.SIGTERM, SIGTERM_handler)
 signal.signal(signal.SIGUSR1, SIGUSR1_handler)
 
 try:
-    opts,args = getopt.getopt(sys.argv[1:], "hn:q", ["help", "thread-number=", "quiet="])
+    opts,args = getopt.getopt(sys.argv[1:], "hn:qx", ["help", "thread-number=", "quiet", "no-cmdline"])
     for opt,arg in opts:
         if opt in ('-h', "--help"):
             usage()
